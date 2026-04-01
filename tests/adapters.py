@@ -1,13 +1,51 @@
 from __future__ import annotations
 
+import json
 import os
+import re
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
+import regex
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from torch import nn
+import math
+
+
+class Linear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.W = nn.Parameter(
+            torch.empty(
+                out_features,
+                in_features,
+                device=device,
+                dtype=dtype,
+            )
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        std = math.sqrt(2.0 / (self.in_features + self.out_features))
+        nn.init.trunc_normal_(self.W, mean=0.0, std=std, a=-3 * std, b=3 * std)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x @ self.W.T
 
 
 def run_linear(
@@ -28,8 +66,44 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
+    module = Linear(
+        in_features=d_in,
+        out_features=d_out,
+        device=weights.device,
+        dtype=weights.dtype,
+    )
+    module.load_state_dict({"W": weights})
+    x = in_features.to(device=weights.device, dtype=weights.dtype)
 
-    raise NotImplementedError
+    with torch.no_grad():
+        return module(x)
+
+class Embedding(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
+        super().__init__()
+
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+
+        self.W = nn.Parameter(
+            torch.empty(
+                num_embeddings,
+                embedding_dim,
+                device=device,
+                dtype=dtype,
+            )
+        )
+        print(self.W)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        std = 1
+        nn.init.trunc_normal_(self.W, mean=0.0, std=std, a=-3, b=3)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.W[x]
+        
 
 
 def run_embedding(
@@ -51,7 +125,17 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    module = Embedding(
+        num_embeddings=vocab_size,
+        embedding_dim=d_model,
+        device=weights.device,
+        dtype=weights.dtype,
+    )
+    module.load_state_dict({"W": weights})
+    x = token_ids.to(device=weights.device)
+
+    with torch.no_grad():
+        return module(x)
 
 
 def run_swiglu(
@@ -562,6 +646,72 @@ def get_tokenizer(
     raise NotImplementedError
 
 
+# Pre-compiled BPE pattern (GPT-2 style)
+_BPE_PAT = regex.compile(
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+)
+
+
+def _find_chunk_boundaries(
+    file_path: str,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """Return byte offsets that divide the file into chunks aligned to split_special_token."""
+    with open(file_path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        file_size = f.tell()
+        f.seek(0)
+
+        chunk_size = file_size // desired_num_chunks
+        boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+        boundaries[-1] = file_size
+
+        mini_chunk_size = 4096
+        for bi in range(1, len(boundaries) - 1):
+            pos = boundaries[bi]
+            f.seek(pos)
+            while True:
+                mini = f.read(mini_chunk_size)
+                if not mini:
+                    boundaries[bi] = file_size
+                    break
+                found = mini.find(split_special_token)
+                if found != -1:
+                    boundaries[bi] = pos + found
+                    break
+                pos += mini_chunk_size
+
+    return sorted(set(boundaries))
+
+
+def _pretokenize_file_chunk(
+    args: tuple[str, int, int, list[str]],
+) -> dict[tuple[int, ...], int]:
+    """Read [start, end) bytes from file, split on special tokens, then pre-tokenize.
+    Returns pretokens as tuple[int] (byte values 0-255) for memory efficiency.
+    """
+    file_path, start, end, special_tokens = args
+    with open(file_path, "rb") as f:
+        f.seek(start)
+        raw = f.read(end - start)
+    text = raw.decode("utf-8", errors="ignore")
+
+    # Split on special tokens so merges don't cross document boundaries
+    if special_tokens:
+        split_pat = regex.compile("|".join(regex.escape(st) for st in special_tokens))
+        sub_chunks = split_pat.split(text)
+    else:
+        sub_chunks = [text]
+
+    counts: dict[tuple[int, ...], int] = defaultdict(int)
+    for chunk in sub_chunks:
+        for match in _BPE_PAT.finditer(chunk):
+            token_bytes = tuple(match.group().encode("utf-8"))  # tuple[int]
+            counts[token_bytes] += 1
+    return dict(counts)
+
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -589,4 +739,168 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    import multiprocessing
+
+    # Initialize vocab with 256 bytes + special tokens
+    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+    next_id = 256
+    for st in special_tokens:
+        vocab[next_id] = st.encode("utf-8")
+        next_id += 1
+
+    num_merges = vocab_size - len(vocab)
+    if num_merges <= 0:
+        return vocab, []
+
+    # Use fork on macOS/Linux to avoid spawn overhead (no re-import of main module)
+    num_workers = kwargs.get("num_workers", multiprocessing.cpu_count())
+    try:
+        mp_ctx = multiprocessing.get_context("fork")
+    except ValueError:
+        mp_ctx = multiprocessing.get_context("spawn")
+
+    split_token = special_tokens[0].encode("utf-8") if special_tokens else b"\n"
+    boundaries = _find_chunk_boundaries(str(input_path), num_workers, split_token)
+
+    chunk_args = [
+        (str(input_path), start, end, special_tokens)
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
+
+    # Parallel pre-tokenization — each worker reads its own slice, no full-file copy
+    pretok_counts: dict[tuple[int, ...], int] = defaultdict(int)
+    if len(chunk_args) > 1:
+        with mp_ctx.Pool(num_workers) as pool:
+            results = pool.map(_pretokenize_file_chunk, chunk_args)
+    else:
+        results = [_pretokenize_file_chunk(chunk_args[0])]
+
+    for partial in results:
+        for token_ints, count in partial.items():
+            pretok_counts[token_ints] += count
+
+    # id_to_bytes: maps token ID (int) -> bytes, used for tie-breaking and vocab
+    # Initially 0-255 are single bytes; new merge tokens get IDs >= 256+len(special_tokens)
+    id_to_bytes: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+    for i, st in enumerate(special_tokens):
+        id_to_bytes[256 + i] = st.encode("utf-8")
+
+    # pretok_list: list of (tuple[int,...], count) — ints are token IDs
+    # pair_to_ids: (id_a, id_b) -> set of pretoken indices containing this pair
+    pretok_list: list[tuple[tuple[int, ...], int]] = list(pretok_counts.items())
+    pair_counts: dict[tuple[int, int], int] = defaultdict(int)
+    pair_to_ids: dict[tuple[int, int], set[int]] = defaultdict(set)
+
+    for idx, (token_ints, count) in enumerate(pretok_list):
+        for i in range(len(token_ints) - 1):
+            pair = (token_ints[i], token_ints[i + 1])
+            pair_counts[pair] += count
+            pair_to_ids[pair].add(idx)
+
+    merges: list[tuple[bytes, bytes]] = []
+
+    for _ in range(num_merges):
+        if not pair_counts:
+            break
+
+        # Tie-break by bytes lexicographic order, not int ID order
+        best_pair = max(
+            pair_counts,
+            key=lambda p: (pair_counts[p], (id_to_bytes[p[0]], id_to_bytes[p[1]])),
+        )
+        if pair_counts[best_pair] == 0:
+            break
+
+        merges.append((id_to_bytes[best_pair[0]], id_to_bytes[best_pair[1]]))
+        new_token_bytes = id_to_bytes[best_pair[0]] + id_to_bytes[best_pair[1]]
+        id_to_bytes[next_id] = new_token_bytes
+        vocab[next_id] = new_token_bytes
+        new_id = next_id
+        next_id += 1
+
+        # Only touch pretokens that contain best_pair (via reverse index)
+        affected_ids = pair_to_ids.pop(best_pair, set())
+        for idx in affected_ids:
+            token_ints, count = pretok_list[idx]
+
+            old_pairs: dict[tuple[int, int], int] = defaultdict(int)
+            for i in range(len(token_ints) - 1):
+                old_pairs[(token_ints[i], token_ints[i + 1])] += 1
+
+            new_token_ints: list[int] = []
+            i = 0
+            while i < len(token_ints):
+                if (
+                    i < len(token_ints) - 1
+                    and token_ints[i] == best_pair[0]
+                    and token_ints[i + 1] == best_pair[1]
+                ):
+                    new_token_ints.append(new_id)
+                    i += 2
+                else:
+                    new_token_ints.append(token_ints[i])
+                    i += 1
+
+            merged = tuple(new_token_ints)
+            pretok_list[idx] = (merged, count)
+
+            new_pairs: dict[tuple[int, int], int] = defaultdict(int)
+            for i in range(len(merged) - 1):
+                new_pairs[(merged[i], merged[i + 1])] += 1
+
+            for pair in set(old_pairs) | set(new_pairs):
+                delta = new_pairs[pair] - old_pairs[pair]
+                if delta == 0:
+                    continue
+                pair_counts[pair] += delta * count
+                if new_pairs[pair] > 0:
+                    pair_to_ids[pair].add(idx)
+                else:
+                    pair_to_ids[pair].discard(idx)
+
+        del pair_counts[best_pair]
+
+    return vocab, merges
+
+
+def save_bpe_vocab(vocab: dict[int, bytes], path: str | os.PathLike) -> None:
+    """Serialize BPE vocab (dict[int, bytes]) to a JSON file.
+    Bytes are stored as lists of ints for lossless round-tripping.
+    """
+    data = {str(k): list(v) for k, v in vocab.items()}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def load_bpe_vocab(path: str | os.PathLike) -> dict[int, bytes]:
+    """Load a vocab file saved by save_bpe_vocab."""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return {int(k): bytes(v) for k, v in data.items()}
+
+
+def save_bpe_merges(merges: list[tuple[bytes, bytes]], path: str | os.PathLike) -> None:
+    """Serialize BPE merges to a text file, one merge per line.
+    Each token is stored as space-separated byte values (decimal ints).
+    Format: "<byte1 byte2 ...> <byte1 byte2 ...>"
+    """
+    with open(path, "w", encoding="utf-8") as f:
+        for a, b in merges:
+            a_str = " ".join(str(x) for x in a)
+            b_str = " ".join(str(x) for x in b)
+            f.write(f"{a_str}\t{b_str}\n")
+
+
+def load_bpe_merges(path: str | os.PathLike) -> list[tuple[bytes, bytes]]:
+    """Load a merges file saved by save_bpe_merges."""
+    merges = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            a_str, b_str = line.split("\t")
+            a = bytes(int(x) for x in a_str.split())
+            b = bytes(int(x) for x in b_str.split())
+            merges.append((a, b))
+    return merges
