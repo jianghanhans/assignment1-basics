@@ -7,6 +7,20 @@ train_bpe_tinystories.py
 
 运行方式:
   python train_bpe_tinystories.py
+
+Training BPE on data/TinyStoriesV2-GPT4-train.txt (vocab_size=10000, workers=56) ...
+
+Saved vocab to output/tinystories_bpe/vocab.json
+Saved merges to output/tinystories_bpe/merges.txt
+
+=== Results ===
+Training time : 456.3s (0.1268 hours)
+Peak memory   : 0.16 GB
+Vocab size    : 10000
+Merges count  : 9743
+Longest token : b' accomplishment'  (len=15)
+Longest token (decoded): ' accomplishment'
+
 """
 import time
 import tracemalloc
