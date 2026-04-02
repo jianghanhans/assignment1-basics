@@ -849,6 +849,10 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
     import multiprocessing
+    import time as _time
+
+    _t_start = _time.time()
+    _log_interval = kwargs.get("log_interval", 500)  # print every N merges
 
     # Initialize vocab with 256 bytes + special tokens
     vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
@@ -878,6 +882,7 @@ def run_train_bpe(
 
     # Parallel pre-tokenization — each worker reads its own slice, no full-file copy
     pretok_counts: dict[tuple[int, ...], int] = defaultdict(int)
+    print(f"[BPE] pretokenizing {input_path} with {num_workers} workers ...", flush=True)
     if len(chunk_args) > 1:
         with mp_ctx.Pool(num_workers) as pool:
             results = pool.map(_pretokenize_file_chunk, chunk_args)
@@ -887,6 +892,13 @@ def run_train_bpe(
     for partial in results:
         for token_ints, count in partial.items():
             pretok_counts[token_ints] += count
+
+    _t_pretok = _time.time()
+    print(
+        f"[BPE] pretokenization done in {_t_pretok - _t_start:.1f}s — "
+        f"{len(pretok_counts)} unique pretokens, starting {num_merges} merges ...",
+        flush=True,
+    )
 
     # id_to_bytes: maps token ID (int) -> bytes, used for tie-breaking and vocab
     # Initially 0-255 are single bytes; new merge tokens get IDs >= 256+len(special_tokens)
@@ -907,18 +919,78 @@ def run_train_bpe(
             pair_to_ids[pair].add(idx)
 
     merges: list[tuple[bytes, bytes]] = []
+    _t_merge_start = _time.time()
 
-    for _ in range(num_merges):
+    # Lazy max-heap by count.
+    # Entry: (-count, pair). Stale entries (count changed) are skipped on pop.
+    # Tie-breaking among equal-count pairs is resolved explicitly after popping
+    # all entries with the same max count.
+    import heapq
+    heap: list[tuple[int, tuple[int, int]]] = []
+    for pair, cnt in pair_counts.items():
+        heapq.heappush(heap, (-cnt, pair))
+
+    def _heap_push(pair: tuple[int, int], cnt: int) -> None:
+        heapq.heappush(heap, (-cnt, pair))
+
+    for merge_step in range(num_merges):
         if not pair_counts:
             break
 
-        # Tie-break by bytes lexicographic order, not int ID order
-        best_pair = max(
-            pair_counts,
-            key=lambda p: (pair_counts[p], (id_to_bytes[p[0]], id_to_bytes[p[1]])),
-        )
-        if pair_counts[best_pair] == 0:
+        # Pop until we find a non-stale entry with the true max count
+        best_pair = None
+        best_cnt = 0
+        while heap:
+            neg_cnt, pair = heapq.heappop(heap)
+            current_cnt = pair_counts.get(pair, 0)
+            if current_cnt == 0:
+                continue
+            if current_cnt != -neg_cnt:
+                # stale — push corrected entry and keep searching
+                _heap_push(pair, current_cnt)
+                continue
+            # found a valid entry; record it as a candidate
+            best_cnt = current_cnt
+            best_pair = pair
             break
+
+        if best_pair is None:
+            break
+
+        # Among all remaining heap entries with the same count, apply
+        # tie-breaking: pick the lexicographically largest bytes pair.
+        # Collect all tied entries into a list, then push losers back.
+        tied: list[tuple[int, int]] = [best_pair]
+        while heap and heap[0][0] == -best_cnt:
+            _, pair2 = heapq.heappop(heap)
+            current_cnt2 = pair_counts.get(pair2, 0)
+            if current_cnt2 == 0:
+                continue
+            if current_cnt2 != best_cnt:
+                _heap_push(pair2, current_cnt2)
+                continue
+            tied.append(pair2)
+
+        # Pick winner by bytes lexicographic order, push losers back
+        best_pair = max(tied, key=lambda p: (id_to_bytes[p[0]], id_to_bytes[p[1]]))
+        for p in tied:
+            if p != best_pair:
+                _heap_push(p, best_cnt)
+
+        # Periodic progress log
+        if merge_step % _log_interval == 0:
+            _now = _time.time()
+            elapsed = _now - _t_merge_start
+            rate = merge_step / elapsed if elapsed > 0 else 0
+            eta = (num_merges - merge_step) / rate if rate > 0 else float("inf")
+            print(
+                f"[BPE] merge {merge_step}/{num_merges}  "
+                f"best=({id_to_bytes[best_pair[0]]!r},{id_to_bytes[best_pair[1]]!r})  "
+                f"count={best_cnt}  "
+                f"pairs={len(pair_counts)}  heap={len(heap)}  "
+                f"{rate:.1f} merges/s  ETA {eta/60:.1f}min",
+                flush=True,
+            )
 
         merges.append((id_to_bytes[best_pair[0]], id_to_bytes[best_pair[1]]))
         new_token_bytes = id_to_bytes[best_pair[0]] + id_to_bytes[best_pair[1]]
@@ -929,22 +1001,43 @@ def run_train_bpe(
 
         # Only touch pretokens that contain best_pair (via reverse index)
         affected_ids = pair_to_ids.pop(best_pair, set())
+        a, b = best_pair
         for idx in affected_ids:
             token_ints, count = pretok_list[idx]
+            n = len(token_ints)
 
-            old_pairs: dict[tuple[int, int], int] = defaultdict(int)
-            for i in range(len(token_ints) - 1):
-                old_pairs[(token_ints[i], token_ints[i + 1])] += 1
-
-            new_token_ints: list[int] = []
+            # Single pass: build merged sequence and collect exact pair deltas.
+            # Only pairs adjacent to a merge site change — no need to scan the
+            # whole token sequence twice to build old_pairs / new_pairs dicts.
+            new_token_ints = []
+            # pair_delta: pair -> net change in occurrence count within this pretoken
+            pair_delta: dict[tuple[int, int], int] = {}
             i = 0
-            while i < len(token_ints):
-                if (
-                    i < len(token_ints) - 1
-                    and token_ints[i] == best_pair[0]
-                    and token_ints[i + 1] == best_pair[1]
-                ):
+            while i < n:
+                if i < n - 1 and token_ints[i] == a and token_ints[i + 1] == b:
+                    # --- remove pairs that disappear at this merge site ---
+                    # left neighbor pair: (token[i-1], a)
+                    if new_token_ints:
+                        lp = (new_token_ints[-1], a)
+                        pair_delta[lp] = pair_delta.get(lp, 0) - 1
+                    # the merged pair itself is consumed (handled by pair_to_ids.pop above)
+                    # right neighbor pair: (b, token[i+2])
+                    if i + 2 < n:
+                        rp = (b, token_ints[i + 2])
+                        pair_delta[rp] = pair_delta.get(rp, 0) - 1
+
                     new_token_ints.append(new_id)
+
+                    # --- add pairs that appear at this merge site ---
+                    # left new pair: (token[i-1], new_id)
+                    if len(new_token_ints) >= 2:
+                        lp_new = (new_token_ints[-2], new_id)
+                        pair_delta[lp_new] = pair_delta.get(lp_new, 0) + 1
+                    # right new pair: (new_id, token[i+2])
+                    if i + 2 < n:
+                        rp_new = (new_id, token_ints[i + 2])
+                        pair_delta[rp_new] = pair_delta.get(rp_new, 0) + 1
+
                     i += 2
                 else:
                     new_token_ints.append(token_ints[i])
@@ -953,25 +1046,22 @@ def run_train_bpe(
             merged = tuple(new_token_ints)
             pretok_list[idx] = (merged, count)
 
-            new_pairs: dict[tuple[int, int], int] = defaultdict(int)
-            for i in range(len(merged) - 1):
-                new_pairs[(merged[i], merged[i + 1])] += 1
-
-            for pair in set(old_pairs) | set(new_pairs):
-                delta = new_pairs[pair] - old_pairs[pair]
+            # Apply deltas to pair_counts, pair_to_ids, and heap
+            for pair, delta in pair_delta.items():
                 if delta == 0:
                     continue
-                pair_counts[pair] += delta * count
-                if new_pairs[pair] > 0:
+                new_cnt = pair_counts.get(pair, 0) + delta * count
+                if new_cnt > 0:
+                    pair_counts[pair] = new_cnt
                     pair_to_ids[pair].add(idx)
+                    _heap_push(pair, new_cnt)
                 else:
+                    pair_counts.pop(pair, None)
                     pair_to_ids[pair].discard(idx)
 
-        del pair_counts[best_pair]
+        pair_counts.pop(best_pair, None)
 
     return vocab, merges
-
-
 def save_bpe_vocab(vocab: dict[int, bytes], path: str | os.PathLike) -> None:
     """Serialize BPE vocab (dict[int, bytes]) to a JSON file.
     Bytes are stored as lists of ints for lossless round-tripping.
