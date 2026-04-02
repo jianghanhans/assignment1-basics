@@ -35,6 +35,16 @@ VOCAB_SIZE = 10_000
 SPECIAL_TOKENS = ["<|endoftext|>"]
 NUM_WORKERS = multiprocessing.cpu_count()  # 56 on this server
 
+'''
+=== Results ===
+Training time : 220.2s (0.0612 hours)
+Peak memory   : 0.15 GB
+Vocab size    : 10000
+Merges count  : 9743
+Longest token : b' accomplishment'  (len=15)
+Longest token (decoded): ' accomplishment'
+'''
+
 if __name__ == "__main__":
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 

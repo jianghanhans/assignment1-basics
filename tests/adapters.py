@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
+import subprocess
 from collections import defaultdict
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
+import numpy as np
 import numpy.typing as npt
 import regex
 import torch
@@ -14,6 +17,53 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from torch import nn
 import math
+
+
+# ── C extension for BPE merge loop ────────────────────────────────────────
+def _load_bpe_lib() -> ctypes.CDLL | None:
+    """Compile (if needed) and load tests/bpe_fast.so. Returns None on failure."""
+    src = os.path.join(os.path.dirname(__file__), "bpe_fast.c")
+    so  = os.path.join(os.path.dirname(__file__), "bpe_fast.so")
+    if not os.path.exists(src):
+        return None
+    # recompile if source is newer than the .so
+    if not os.path.exists(so) or os.path.getmtime(src) > os.path.getmtime(so):
+        ret = subprocess.call(
+            ["gcc", "-O3", "-march=native", "-shared", "-fPIC", "-o", so, src],
+            stderr=subprocess.DEVNULL,
+        )
+        if ret != 0:
+            return None
+    try:
+        lib = ctypes.CDLL(so)
+    except OSError:
+        return None
+
+    _p32 = ctypes.POINTER(ctypes.c_int32)
+    _p64 = ctypes.POINTER(ctypes.c_int64)
+
+    lib.bpe_count_pairs.restype  = ctypes.c_int32
+    lib.bpe_count_pairs.argtypes = [
+        _p32, _p32, _p32, _p32, ctypes.c_int32,   # flat,starts,lens,freqs,n
+        _p32, _p32, _p64, ctypes.c_int32,          # out_a,out_b,out_cnt,max
+    ]
+    lib.bpe_full_merge.restype  = ctypes.c_int32
+    lib.bpe_full_merge.argtypes = [
+        _p32, _p32, _p32, _p32, ctypes.c_int32,              # flat,starts,lens,freqs,n
+        ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,       # pa,pb,new_id
+        _p32, _p32, _p64, ctypes.c_int32,                     # out_a,out_b,out_delta,max
+    ]
+    return lib
+
+
+_bpe_lib: ctypes.CDLL | None = None
+
+try:
+    _bpe_lib = _load_bpe_lib()
+    if _bpe_lib is not None:
+        print("[BPE] C extension loaded.", flush=True)
+except Exception:
+    pass
 
 
 class Linear(nn.Module):
@@ -901,30 +951,74 @@ def run_train_bpe(
     )
 
     # id_to_bytes: maps token ID (int) -> bytes, used for tie-breaking and vocab
-    # Initially 0-255 are single bytes; new merge tokens get IDs >= 256+len(special_tokens)
     id_to_bytes: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
     for i, st in enumerate(special_tokens):
         id_to_bytes[256 + i] = st.encode("utf-8")
 
-    # pretok_list: list of (tuple[int,...], count) — ints are token IDs
-    # pair_to_ids: (id_a, id_b) -> set of pretoken indices containing this pair
-    pretok_list: list[tuple[tuple[int, ...], int]] = list(pretok_counts.items())
-    pair_counts: dict[tuple[int, int], int] = defaultdict(int)
-    pair_to_ids: dict[tuple[int, int], set[int]] = defaultdict(set)
+    # ── Build CSR storage for pretokens ────────────────────────────────────
+    # flat    : all token IDs concatenated (modified in-place by C merges)
+    # starts  : flat[starts[i]:starts[i]+lens[i]] = pretoken i
+    # lens    : current length of each pretoken
+    # freqs   : occurrence frequency
 
-    for idx, (token_ints, count) in enumerate(pretok_list):
-        for i in range(len(token_ints) - 1):
-            pair = (token_ints[i], token_ints[i + 1])
-            pair_counts[pair] += count
-            pair_to_ids[pair].add(idx)
+    pretok_items = list(pretok_counts.items())  # list[(tuple[int,...], int)]
+    n_pretok = len(pretok_items)
+    lens_np  = np.array([len(t)   for t, _ in pretok_items], dtype=np.int32)
+    freqs_np = np.array([c        for _, c in pretok_items], dtype=np.int32)
+    starts_np = np.zeros(n_pretok, dtype=np.int32)
+    if n_pretok > 1:
+        starts_np[1:] = np.cumsum(lens_np[:-1])
+    total_toks = int(lens_np.sum())
+    flat_np = np.empty(total_toks, dtype=np.int32)
+    for i, (tup, _) in enumerate(pretok_items):
+        s = starts_np[i]
+        flat_np[s:s + lens_np[i]] = tup
+
+    # Output buffers for C functions (generous upper bound on unique pair changes)
+    _MAX_OUT = 200_000
+    _out_a   = np.empty(_MAX_OUT, dtype=np.int32)
+    _out_b   = np.empty(_MAX_OUT, dtype=np.int32)
+    _out_v   = np.empty(_MAX_OUT, dtype=np.int64)
+
+    # Helper: get ctypes pointer from numpy array
+    def _ptr32(arr: np.ndarray) -> ctypes.POINTER:
+        return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+
+    def _ptr64(arr: np.ndarray) -> ctypes.POINTER:
+        return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+
+    # ── Build initial pair_counts ──────────────────────────────────────────
+    pair_counts: dict[tuple[int, int], int] = {}
+
+    if _bpe_lib is not None:
+        n_pairs = _bpe_lib.bpe_count_pairs(
+            _ptr32(flat_np), _ptr32(starts_np), _ptr32(lens_np), _ptr32(freqs_np),
+            ctypes.c_int32(n_pretok),
+            _ptr32(_out_a), _ptr32(_out_b), _ptr64(_out_v),
+            ctypes.c_int32(_MAX_OUT),
+        )
+        for k in range(n_pairs):
+            pair_counts[(_out_a[k].item(), _out_b[k].item())] = int(_out_v[k])
+    else:
+        # Pure-Python fallback
+        for tup, cnt in pretok_items:
+            for i in range(len(tup) - 1):
+                p = (tup[i], tup[i + 1])
+                pair_counts[p] = pair_counts.get(p, 0) + cnt
+
+    # pair_to_ids is only used in the Python fallback path
+    pair_to_ids: dict[tuple[int, int], set[int]] = defaultdict(set)
+    if _bpe_lib is None:
+        for idx, (tup, _) in enumerate(pretok_items):
+            for i in range(len(tup) - 1):
+                pair_to_ids[(tup[i], tup[i + 1])].add(idx)
+        # Keep pretok_list for Python fallback
+        pretok_list: list[tuple[tuple[int, ...], int]] = list(pretok_items)
 
     merges: list[tuple[bytes, bytes]] = []
     _t_merge_start = _time.time()
 
-    # Lazy max-heap by count.
-    # Entry: (-count, pair). Stale entries (count changed) are skipped on pop.
-    # Tie-breaking among equal-count pairs is resolved explicitly after popping
-    # all entries with the same max count.
+    # Lazy max-heap — same as before
     import heapq
     heap: list[tuple[int, tuple[int, int]]] = []
     for pair, cnt in pair_counts.items():
@@ -937,29 +1031,25 @@ def run_train_bpe(
         if not pair_counts:
             break
 
-        # Pop until we find a non-stale entry with the true max count
+        # Pop until non-stale entry
         best_pair = None
-        best_cnt = 0
+        best_cnt  = 0
         while heap:
             neg_cnt, pair = heapq.heappop(heap)
             current_cnt = pair_counts.get(pair, 0)
             if current_cnt == 0:
                 continue
             if current_cnt != -neg_cnt:
-                # stale — push corrected entry and keep searching
                 _heap_push(pair, current_cnt)
                 continue
-            # found a valid entry; record it as a candidate
-            best_cnt = current_cnt
+            best_cnt  = current_cnt
             best_pair = pair
             break
 
         if best_pair is None:
             break
 
-        # Among all remaining heap entries with the same count, apply
-        # tie-breaking: pick the lexicographically largest bytes pair.
-        # Collect all tied entries into a list, then push losers back.
+        # Collect tied entries, pick lexicographically largest bytes pair
         tied: list[tuple[int, int]] = [best_pair]
         while heap and heap[0][0] == -best_cnt:
             _, pair2 = heapq.heappop(heap)
@@ -970,24 +1060,21 @@ def run_train_bpe(
                 _heap_push(pair2, current_cnt2)
                 continue
             tied.append(pair2)
-
-        # Pick winner by bytes lexicographic order, push losers back
         best_pair = max(tied, key=lambda p: (id_to_bytes[p[0]], id_to_bytes[p[1]]))
         for p in tied:
             if p != best_pair:
                 _heap_push(p, best_cnt)
 
-        # Periodic progress log
+        # Progress log
         if merge_step % _log_interval == 0:
             _now = _time.time()
             elapsed = _now - _t_merge_start
             rate = merge_step / elapsed if elapsed > 0 else 0
-            eta = (num_merges - merge_step) / rate if rate > 0 else float("inf")
+            eta  = (num_merges - merge_step) / rate if rate > 0 else float("inf")
             print(
                 f"[BPE] merge {merge_step}/{num_merges}  "
                 f"best=({id_to_bytes[best_pair[0]]!r},{id_to_bytes[best_pair[1]]!r})  "
-                f"count={best_cnt}  "
-                f"pairs={len(pair_counts)}  heap={len(heap)}  "
+                f"count={best_cnt}  pairs={len(pair_counts)}  heap={len(heap)}  "
                 f"{rate:.1f} merges/s  ETA {eta/60:.1f}min",
                 flush=True,
             )
@@ -995,71 +1082,73 @@ def run_train_bpe(
         merges.append((id_to_bytes[best_pair[0]], id_to_bytes[best_pair[1]]))
         new_token_bytes = id_to_bytes[best_pair[0]] + id_to_bytes[best_pair[1]]
         id_to_bytes[next_id] = new_token_bytes
-        vocab[next_id] = new_token_bytes
-        new_id = next_id
+        vocab[next_id]       = new_token_bytes
+        new_id  = next_id
         next_id += 1
 
-        # Only touch pretokens that contain best_pair (via reverse index)
-        affected_ids = pair_to_ids.pop(best_pair, set())
-        a, b = best_pair
-        for idx in affected_ids:
-            token_ints, count = pretok_list[idx]
-            n = len(token_ints)
+        pa, pb = best_pair
 
-            # Single pass: build merged sequence and collect exact pair deltas.
-            # Only pairs adjacent to a merge site change — no need to scan the
-            # whole token sequence twice to build old_pairs / new_pairs dicts.
-            new_token_ints = []
-            # pair_delta: pair -> net change in occurrence count within this pretoken
-            pair_delta: dict[tuple[int, int], int] = {}
-            i = 0
-            while i < n:
-                if i < n - 1 and token_ints[i] == a and token_ints[i + 1] == b:
-                    # --- remove pairs that disappear at this merge site ---
-                    # left neighbor pair: (token[i-1], a)
-                    if new_token_ints:
-                        lp = (new_token_ints[-1], a)
-                        pair_delta[lp] = pair_delta.get(lp, 0) - 1
-                    # the merged pair itself is consumed (handled by pair_to_ids.pop above)
-                    # right neighbor pair: (b, token[i+2])
-                    if i + 2 < n:
-                        rp = (b, token_ints[i + 2])
-                        pair_delta[rp] = pair_delta.get(rp, 0) - 1
-
-                    new_token_ints.append(new_id)
-
-                    # --- add pairs that appear at this merge site ---
-                    # left new pair: (token[i-1], new_id)
-                    if len(new_token_ints) >= 2:
-                        lp_new = (new_token_ints[-2], new_id)
-                        pair_delta[lp_new] = pair_delta.get(lp_new, 0) + 1
-                    # right new pair: (new_id, token[i+2])
-                    if i + 2 < n:
-                        rp_new = (new_id, token_ints[i + 2])
-                        pair_delta[rp_new] = pair_delta.get(rp_new, 0) + 1
-
-                    i += 2
-                else:
-                    new_token_ints.append(token_ints[i])
-                    i += 1
-
-            merged = tuple(new_token_ints)
-            pretok_list[idx] = (merged, count)
-
-            # Apply deltas to pair_counts, pair_to_ids, and heap
-            for pair, delta in pair_delta.items():
-                if delta == 0:
-                    continue
-                new_cnt = pair_counts.get(pair, 0) + delta * count
+        if _bpe_lib is not None:
+            # ── C path: full scan + in-place merge + aggregated deltas ────
+            n_changes = _bpe_lib.bpe_full_merge(
+                _ptr32(flat_np), _ptr32(starts_np), _ptr32(lens_np), _ptr32(freqs_np),
+                ctypes.c_int32(n_pretok),
+                ctypes.c_int32(pa), ctypes.c_int32(pb), ctypes.c_int32(new_id),
+                _ptr32(_out_a), _ptr32(_out_b), _ptr64(_out_v),
+                ctypes.c_int32(_MAX_OUT),
+            )
+            pair_counts.pop(best_pair, None)
+            for k in range(n_changes):
+                p    = (_out_a[k].item(), _out_b[k].item())
+                new_cnt = pair_counts.get(p, 0) + int(_out_v[k])
                 if new_cnt > 0:
-                    pair_counts[pair] = new_cnt
-                    pair_to_ids[pair].add(idx)
-                    _heap_push(pair, new_cnt)
+                    pair_counts[p] = new_cnt
+                    _heap_push(p, new_cnt)
                 else:
-                    pair_counts.pop(pair, None)
-                    pair_to_ids[pair].discard(idx)
+                    pair_counts.pop(p, None)
 
-        pair_counts.pop(best_pair, None)
+        else:
+            # ── Pure-Python fallback ───────────────────────────────────────
+            affected_ids = pair_to_ids.pop(best_pair, set())
+            for idx in affected_ids:
+                token_ints, count = pretok_list[idx]
+                n = len(token_ints)
+                new_token_ints = []
+                pair_delta: dict[tuple[int, int], int] = {}
+                i = 0
+                while i < n:
+                    if i < n - 1 and token_ints[i] == pa and token_ints[i + 1] == pb:
+                        if new_token_ints:
+                            lp = (new_token_ints[-1], pa)
+                            pair_delta[lp] = pair_delta.get(lp, 0) - 1
+                        if i + 2 < n:
+                            rp = (pb, token_ints[i + 2])
+                            pair_delta[rp] = pair_delta.get(rp, 0) - 1
+                        new_token_ints.append(new_id)
+                        if len(new_token_ints) >= 2:
+                            lp_new = (new_token_ints[-2], new_id)
+                            pair_delta[lp_new] = pair_delta.get(lp_new, 0) + 1
+                        if i + 2 < n:
+                            rp_new = (new_id, token_ints[i + 2])
+                            pair_delta[rp_new] = pair_delta.get(rp_new, 0) + 1
+                        i += 2
+                    else:
+                        new_token_ints.append(token_ints[i])
+                        i += 1
+                merged = tuple(new_token_ints)
+                pretok_list[idx] = (merged, count)
+                for pair, delta in pair_delta.items():
+                    if delta == 0:
+                        continue
+                    new_cnt = pair_counts.get(pair, 0) + delta * count
+                    if new_cnt > 0:
+                        pair_counts[pair] = new_cnt
+                        pair_to_ids[pair].add(idx)
+                        _heap_push(pair, new_cnt)
+                    else:
+                        pair_counts.pop(pair, None)
+                        pair_to_ids[pair].discard(idx)
+            pair_counts.pop(best_pair, None)
 
     return vocab, merges
 def save_bpe_vocab(vocab: dict[int, bytes], path: str | os.PathLike) -> None:

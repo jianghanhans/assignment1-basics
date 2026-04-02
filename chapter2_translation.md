@@ -89,7 +89,7 @@ def decode_utf8_bytes_to_str_wrong(bytestring: bytes):
 
 子词 tokenization 介于词级分词器与字节级分词器之间。注意：字节级分词器的词表只有 256 个条目（字节值为 0 到 255）。子词分词器用更大的词表换取对输入字节序列更好的压缩。例如，如果字节序列 `b'the'` 在训练文本中频繁出现，把它作为一个词表条目，就能把这个原本长度为 3 的 token 序列压缩为单个 token。
 
-我们如何选择这些要添加到词汇表中的子词单元？Sennrich等人\[2016]提出使用字节对编码（BPE；Gage，1994），这是一种压缩算法，迭代地用单个新的未使用索引替换（"合并"）最频繁的字节对。请注意，此算法将子词标记添加到我们的词汇表中，以最大化输入序列的压缩 - 如果一个词在我们的输入文本中出现足够多次，它将被表示为单个子词单元。
+我们如何选择这些要加入词表的子词单元？Sennrich等人\[2016]提出使用字节对编码（BPE；Gage，1994）：这是一种压缩算法，会迭代地把出现频率最高的一对字节合并为一个新的 token（使用一个新的、未使用的索引表示）。该算法通过不断向词表添加这些合并得到的子词 token 来最大化对输入序列的压缩——如果某个词在训练文本中出现足够多次，它最终可能会被表示为单个子词 token。
 
 使用 BPE 构建词表的子词分词器通常称为 BPE 分词器。在本作业中，我们将实现一个字节级 BPE 分词器：词表中的条目要么是单个字节，要么是合并后的字节序列，从而兼顾了 OOV 处理与更短、更可训练的输入序列长度。构建 BPE 分词器词表的过程称为 “training”（训练）BPE 分词器。
 
@@ -145,7 +145,7 @@ newest newest newest newest newest newest
 
 并且词表中包含一个特殊 token `<|endoftext|>`。
 
-**词汇表** 我们用特殊 token `<|endoftext|>` 和 256 个字节值初始化词表。
+**词表** 我们用特殊 token `<|endoftext|>` 和 256 个字节值初始化词表。
 
 **预分词** 为简单起见并专注于 merge 过程，我们在这个示例中假设预分词只是按空格切分。当我们进行预分词并计数时，最终得到频率表：
 
@@ -153,7 +153,7 @@ newest newest newest newest newest newest
 {low: 5, lower: 2, widest: 3, newest: 6}
 ```
 
-<sup>2</sup> 请注意，原始BPE公式\[Sennrich等人，2016]指定包含词尾标记。在训练字节级BPE模型时，我们不添加词尾标记，因为所有字节（包括空格和标点符号）都包含在模型的词汇表中。由于我们明确表示空格和标点符号，学习的BPE合并将自然反映这些词边界。
+<sup>2</sup> 请注意，原始BPE公式\[Sennrich等人，2016]指定包含词尾标记。在训练字节级BPE模型时，我们不添加词尾标记，因为所有字节（包括空格和标点符号）都包含在模型的词表中。由于我们显式表示空格和标点符号，学习到的 BPE merges 会自然反映这些词边界。
 
 将其表示为`dict[tuple[bytes], int]`很方便，例如`{(l,o,w): 5 …}`。请注意，即使是单个字节在Python中也是一个`bytes`对象。Python中没有`byte`类型来表示单个字节，就像没有`char`类型来表示单个字符一样。
 
@@ -161,7 +161,7 @@ newest newest newest newest newest newest
 
 在第二轮中，我们看到`(e, st)`是最常见的对（计数为9），我们将合并为`{ (l,o,w): 5, (l,o,w,e,r): 2, (w,i,d,est): 3, (n,e,w,est): 6 }`。继续这样，我们最终得到的合并序列将是`['s t', 'e st', 'o w', 'l ow', 'w est', 'n e', 'ne west', 'w i', 'wi d', 'wid est', 'low e', 'lowe r']`。
 
-如果我们进行6次合并，我们有`['s t', 'e st', 'o w', 'l ow', 'w est', 'n e']`，我们的词汇表元素将是`[<|endoftext|>, [...256 BYTE CHARS], st, est, ow, low, west, ne]`。
+如果我们进行6次合并，我们有`['s t', 'e st', 'o w', 'l ow', 'w est', 'n e']`，我们的词表条目将是`[<|endoftext|>, [...256 BYTE CHARS], st, est, ow, low, west, ne]`。
 
 使用这套词表与 merges，单词 `newest` 会被分词为 `[ne, west]`。
 
@@ -192,10 +192,10 @@ newest newest newest newest newest newest
 **交付物：** 编写一个函数，给定输入文本文件的路径，训练一个（字节级）BPE 分词器。您的BPE训练函数应该处理（至少）以下输入参数：
 
 - `input_path: str`：BPE 分词器训练数据的文本文件路径。
-- `vocab_size: int`：定义最大最终词汇表大小的正整数（包括初始字节词表、合并产生的词表项以及任何特殊 token）。
+- `vocab_size: int`：定义最大最终词表大小的正整数（包括初始字节词表、合并产生的词表项以及任何特殊 token）。
 - `special_tokens: list[str]`：要添加到词表的字符串列表。这些特殊 token 不会以其他方式影响 BPE 训练。
 
-您的BPE训练函数应该返回生成的词汇表和合并：
+您的BPE训练函数应该返回生成的词表和 merges：
 
 - `vocab: dict[int, bytes]`：分词器词表，从 int（词表中的 token ID）到 bytes（token 的字节串）的映射。
 - `merges: list[tuple[bytes, bytes]]`：训练产生的BPE合并列表。每个列表项是一个bytes元组`<token1>, <token2>`，表示`<token1>`与`<token2>`合并。合并应按创建顺序排序。
@@ -204,7 +204,7 @@ newest newest newest newest newest newest
 
 **问题（train\_bpe\_tinystories）：在TinyStories上训练 BPE（2分）**
 
-(a) 在TinyStories数据集上训练一个字节级 BPE 分词器，使用最大词汇表大小为10,000。确保将TinyStories的`<|endoftext|>`特殊 token 添加到词表中。将生成的词表与 merges 序列化到磁盘以供进一步检查。训练花费了多少小时和内存？词表中最长的 token 是什么？这是否有意义？
+(a) 在TinyStories数据集上训练一个字节级 BPE 分词器，使用最大词表大小为10,000。确保将TinyStories的`<|endoftext|>`特殊 token 添加到词表中。将生成的词表与 merges 序列化到磁盘以供进一步检查。训练花费了多少小时和内存？词表中最长的 token 是什么？这是否有意义？
 
 **资源要求：** ≤30分钟（无GPU），≤30GB RAM
 
@@ -223,7 +223,7 @@ newest newest newest newest newest newest
 
 **问题（train\_bpe\_expts\_owt）：在OpenWebText上训练BPE（2分）**
 
-(a) 在OpenWebText数据集上训练一个字节级 BPE 分词器，使用最大词汇表大小为32,000。将生成的词表与 merges 序列化到磁盘以供进一步检查。词表中最长的 token 是什么？这是否有意义？
+(a) 在OpenWebText数据集上训练一个字节级 BPE 分词器，使用最大词表大小为32,000。将生成的词表与 merges 序列化到磁盘以供进一步检查。词表中最长的 token 是什么？这是否有意义？
 
 **资源要求：** ≤12小时（无GPU），≤100GB RAM
 
